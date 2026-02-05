@@ -35,13 +35,23 @@ class AuthController extends Controller
         if (Auth::attempt($credentials)) {
             try {
                 $data = User::where('email', $credentials['email'])->firstOrFail();
+
+                $emailVerificationEnabled = config('auth-extra.email_verification_enabled');
+
+                if ($emailVerificationEnabled && !$data->email_verified_at) {
+                    return response()->json([
+                        'result' => false,
+                        'message' => 'Email belum diverifikasi. Silakan verifikasi email Anda terlebih dahulu.',
+                        'data' => null,
+                    ], 403);
+                }
                 
-                // Check if email is verified
-                if (!$data->email_verified_at) {
-                    $status = 403;
-                    $result = false;
-                    $message = 'Email belum diverifikasi. Silakan verifikasi email Anda terlebih dahulu.';
-                    $data = null;
+                // // Check if email is verified
+                // if (!$data->email_verified_at) {
+                //     $status = 403;
+                //     $result = false;
+                //     $message = 'Email belum diverifikasi. Silakan verifikasi email Anda terlebih dahulu.';
+                //     $data = null;
                 } else {
                     $token = $data->createToken($request->device_name)->plainTextToken;
                     $this->getDataApplications($data);
@@ -118,118 +128,153 @@ class AuthController extends Controller
         return response()->json($response, $status);
     }
 
-    public function register(Request $request)
-    {
-        $request->validate([
-            'name' => 'required|string|max:255',
-            'email' => 'required|string|email|max:255',
-            'password' => 'required|string|min:8|confirmed',
-        ]);
+public function register(Request $request)
+{
+    $request->validate([
+        'name' => 'required|string|max:255',
+        'email' => 'required|string|email|max:255',
+        'password' => 'required|string|min:8|confirmed',
+        'device_name' => 'required|string|max:255',
+    ]);
 
-        try {
-            // Check if user already exists
-            $existingUser = User::where('email', $request->email)->first();
+    $emailVerificationEnabled = config('auth-extra.email_verification_enabled');
 
-            if ($existingUser) {
-                // If user exists and is already verified
-                if ($existingUser->email_verified_at) {
-                    return response()->json([
-                        'result' => false,
-                        'message' => 'Email sudah terdaftar dan terverifikasi. Silakan login.',
-                    ], 422);
-                }
+    try {
+        // cek user existing
+        $existingUser = User::where('email', $request->email)->first();
 
-                // If user exists but not verified, check rate limit
-                $oneDayAgo = Carbon::now()->subDay();
-                $attemptCount = TokenVerification::where('identifier', $request->email)
-                    ->where('type', 'email')
-                    ->where('created_at', '>=', $oneDayAgo)
-                    ->count();
+        // kalau sudah ada dan sudah verified
+        if ($existingUser && $existingUser->email_verified_at) {
+            return response()->json([
+                'result' => false,
+                'message' => 'Email sudah terdaftar. Silakan login.',
+            ], 422);
+        }
 
-                if ($attemptCount >= 5) {
-                    return response()->json([
-                        'result' => false,
-                        'message' => 'Anda telah mencapai batas maksimal pengiriman email verifikasi (5x dalam 24 jam). Silakan coba lagi besok.',
-                    ], 429);
-                }
+        DB::beginTransaction();
 
-                // Use existing user
-                $user = $existingUser;
-                $isNewUser = false;
-            } else {
-                DB::beginTransaction();
-                try {
-                    // Create new user
-                    $user = User::create([
-                        'name' => $request->name,
-                        'email' => $request->email,
-                        'password' => Hash::make($request->password),
-                    ]);
+        // kalau user belum ada → create
+        if (! $existingUser) {
+            $user = User::create([
+                'name' => $request->name,
+                'email' => $request->email,
+                'password' => Hash::make($request->password),
 
-                    $user->authorities()->attach([
-                        'f18fa99e-8d3c-4b6b-91a3-9c0000000003' => ['id' => \Illuminate\Support\Str::uuid()]
-                    ]); 
-                    
-                    $isNewUser = true;
-                    DB::commit();
-                } catch (\Exception $e) {
-                    DB::rollback();
-                    throw $e;
-                }
-            }
-
-            // Generate OTP code
-            $otpCode = rand(100000, 999999);
-
-            // Store verification token
-            TokenVerification::create([
-                'type' => 'email',
-                'identifier' => $request->email,
-                'token' => $otpCode,
-                'expires_at' => Carbon::now()->addMinutes(5),
-                'used' => false,
+                // kalau verifikasi dimatikan → langsung verified
+                'email_verified_at' => $emailVerificationEnabled ? null : now(),
             ]);
 
-            // Create verification URL
-            $verificationUrl = config('app.url').'/app/verify-email?token='.$otpCode.'&email='.urlencode($request->email);
+            $user->authorities()->attach([
+                'f18fa99e-8d3c-4b6b-91a3-9c0000000003' => [
+                    'id' => \Illuminate\Support\Str::uuid()
+                ]
+            ]);
 
-            // Determine email recipient (redirect to test email in non-production)
-            $emailRecipient = config('app.env') === 'production' ? $user->email : '211232638@uii.ac.id';
+            $isNewUser = true;
+        } else {
+            // pakai user lama (belum verified)
+            $user = $existingUser;
+            $isNewUser = false;
 
-            // Log email redirection in non-production environments
-            if (config('app.env') !== 'production') {
-                Log::info("Email redirected from {$user->email} to {$emailRecipient} (non-production environment)");
+            // kalau verifikasi dimatikan → langsung verified juga
+            if (! $user->email_verified_at && ! $emailVerificationEnabled) {
+                $user->email_verified_at = now();
+                $user->save();
             }
+        }
 
-            // Send verification email
-            // Mail::to($emailRecipient)->send(new EmailVerification($otpCode, $verificationUrl, $user->name));
+        DB::commit();
 
-            $message = $isNewUser
-                ? 'Pendaftaran berhasil! Silakan cek email Anda untuk verifikasi.'
-                : 'Email verifikasi telah dikirim ulang. Silakan cek email Anda.';
+        /**
+         * ==========================================================
+         * MODE: EMAIL VERIFICATION OFF
+         * ==========================================================
+         */
+        if (! $emailVerificationEnabled) {
 
-            // Show OTP in non-production environments
-            if (config('app.env') !== 'production') {
-                $message .= ' OTP: ' . $otpCode;
-            }
+            // auto login + token
+            $token = $user->createToken($request->device_name)->plainTextToken;
+            $user['token'] = $token;
 
             return response()->json([
                 'result' => true,
-                'message' => $message,
-                'data' => [
-                    'email' => $user->email,
-                    'is_new_user' => $isNewUser,
-                ],
+                'message' => $isNewUser
+                    ? 'Register berhasil (email auto-verified).'
+                    : 'Akun sudah ada, email auto-verified.',
+                'data' => $user,
             ], $isNewUser ? 201 : 200);
-        } catch (\Throwable $th) {
-            Log::error('Registration Error: '.$th->getMessage());
+        }
 
+        /**
+         * ==========================================================
+         * MODE: EMAIL VERIFICATION ON
+         * ==========================================================
+         */
+
+        // Rate limit OTP: 5x per 24 jam
+        $oneDayAgo = Carbon::now()->subDay();
+        $attemptCount = TokenVerification::where('identifier', $request->email)
+            ->where('type', 'email')
+            ->where('created_at', '>=', $oneDayAgo)
+            ->count();
+
+        if ($attemptCount >= 5) {
             return response()->json([
                 'result' => false,
-                'message' => 'Terjadi kesalahan saat mendaftar. Silakan coba lagi.',
-            ], 500);
+                'message' => 'Anda telah mencapai batas maksimal pengiriman email verifikasi (5x dalam 24 jam). Silakan coba lagi besok.',
+            ], 429);
         }
+
+        // Generate OTP
+        $otpCode = rand(100000, 999999);
+
+        TokenVerification::create([
+            'type' => 'email',
+            'identifier' => $request->email,
+            'token' => $otpCode,
+            'expires_at' => Carbon::now()->addMinutes(5),
+            'used' => false,
+        ]);
+
+        $verificationUrl = config('app.url')
+            . '/app/verify-email?token=' . $otpCode
+            . '&email=' . urlencode($request->email);
+
+        // Redirect email for testing (optional)
+        $redirectEmail = config('auth-extra.email_verification_test_redirect');
+
+        $emailRecipient = $redirectEmail ?: $user->email;
+
+        if ($redirectEmail) {
+            Log::info("Email redirected from {$user->email} to {$emailRecipient}");
+        }
+
+        Mail::to($emailRecipient)->send(
+            new EmailVerification($otpCode, $verificationUrl, $user->name)
+        );
+
+        return response()->json([
+            'result' => true,
+            'message' => $isNewUser
+                ? 'Pendaftaran berhasil! Silakan cek email Anda untuk verifikasi.'
+                : 'Email verifikasi telah dikirim ulang. Silakan cek email Anda.',
+            'data' => [
+                'email' => $user->email,
+                'is_new_user' => $isNewUser,
+            ],
+        ], $isNewUser ? 201 : 200);
+
+    } catch (\Throwable $th) {
+        DB::rollBack();
+        Log::error('Registration Error: ' . $th->getMessage());
+
+        return response()->json([
+            'result' => false,
+            'message' => 'Terjadi kesalahan saat mendaftar. Silakan coba lagi.',
+        ], 500);
     }
+}
+
 
     public function logout(Request $request)
     {
